@@ -168,17 +168,19 @@ def sample_clip_timepoints(
 def load_and_transform_vision_data(
     image_paths: Optional[list[str]],
     device: torch.device | str,
+    image_size: int = 224,
 ) -> Optional[torch.Tensor]:
     """Load and preprocess images for vision encoder.
 
-    Applies standard ImageNet normalization and resizing to 224x224.
+    Applies standard ImageNet normalization and resizing.
 
     Args:
         image_paths: List of file paths to images, or None.
         device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
+        image_size: Target size for image resize and crop.
 
     Returns:
-        Tensor of shape (batch_size, 3, 224, 224) containing preprocessed images,
+        Tensor of shape (batch_size, 3, image_size, image_size) containing preprocessed images,
         or None if image_paths is None.
     """
     if image_paths is None:
@@ -188,8 +190,10 @@ def load_and_transform_vision_data(
 
     data_transform = transforms.Compose(
         [
-            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(224),
+            transforms.Resize(
+                image_size, interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=(0.48145466, 0.4578275, 0.40821073),
@@ -571,17 +575,17 @@ class SpatialCrop(nn.Module):
         """Apply spatial crops to a list of videos.
 
         Args:
-            videos: List of video tensors, each of shape (C, T, H, W).
+            videos: List of video tensors, each of shape (T, C, H, W).
 
         Returns:
-            List of cropped videos, each of shape (C, T, crop_size, crop_size).
+            List of cropped videos, each of shape (T, C, crop_size, crop_size).
             Length is num_crops times the input length.
 
         Raises:
             AssertionError: If input is not a list or videos don't have 4 dimensions.
         """
         assert isinstance(videos, list), "Must be a list of videos after temporal crops"
-        assert all([video.ndim == 4 for video in videos]), "Must be (C,T,H,W)"
+        assert all([video.ndim == 4 for video in videos]), "Must be (T,C,H,W)"
 
         res = []
         for video in videos:
@@ -605,32 +609,25 @@ def subsample_frames_uniformly(video: torch.Tensor, num_samples: int) -> torch.T
     Replacement for pytorchvideo's UniformTemporalSubsample.
 
     Args:
-        video: Video tensor of shape (C, T, H, W) or (T, H, W, C).
+        video: Video tensor of shape (T, C, H, W).
         num_samples: Number of frames to sample.
 
     Returns:
-        Subsampled video tensor with num_samples frames.
+        Subsampled video tensor with num_samples frames in shape (T, C, H, W).
 
     Example:
-        >>> video = torch.randn(3, 100, 224, 224)  # 100 frames
+        >>> video = torch.randn(100, 3, 224, 224)  # 100 frames, 3 channels
         >>> sampled = subsample_frames_uniformly(video, 10)  # 10 frames
         >>> sampled.shape
-        torch.Size([3, 10, 224, 224])
+        torch.Size([10, 3, 224, 224])
     """
-    # Determine format: (C, T, H, W) or (T, H, W, C)
-    if video.ndim == 4:
-        if video.shape[0] == 3 or video.shape[0] == 1:
-            # Likely (C, T, H, W)
-            num_frames = video.shape[1]
-            indices = torch.linspace(0, num_frames - 1, num_samples).long()
-            return video[:, indices, :, :]
-        else:
-            # Likely (T, H, W, C)
-            num_frames = video.shape[0]
-            indices = torch.linspace(0, num_frames - 1, num_samples).long()
-            return video[indices, :, :, :]
-    else:
+    if video.ndim != 4:
         raise ValueError(f"Expected 4D tensor, got shape {video.shape}")
+
+    # Assume (T, C, H, W) format
+    num_frames = video.shape[0]
+    indices = torch.linspace(0, num_frames - 1, num_samples).long()
+    return video[indices, :, :, :]
 
 
 def resize_short_side_video(
@@ -642,19 +639,19 @@ def resize_short_side_video(
     Replacement for pytorchvideo's ShortSideScale. Maintains aspect ratio.
 
     Args:
-        video: Video tensor of shape (C, T, H, W).
+        video: Video tensor of shape (T, C, H, W).
         target_size: Target size for the shorter spatial dimension.
 
     Returns:
-        Resized video tensor of shape (C, T, new_H, new_W).
+        Resized video tensor of shape (T, C, new_H, new_W).
 
     Example:
-        >>> video = torch.randn(3, 10, 480, 640)  # 480x640 video
+        >>> video = torch.randn(10, 3, 480, 640)  # 10 frames, 3 channels, 480x640
         >>> resized = resize_short_side_video(video, 224)
         >>> resized.shape  # Shorter side (480) becomes 224
-        torch.Size([3, 10, 224, 298])
+        torch.Size([10, 3, 224, 298])
     """
-    C, T, H, W = video.shape
+    T, C, H, W = video.shape
 
     # Calculate new dimensions maintaining aspect ratio
     if H < W:
@@ -664,23 +661,23 @@ def resize_short_side_video(
         new_h = int(H * target_size / W)
         new_w = target_size
 
-    # Reshape to (C*T, 1, H, W) for interpolate (treats each frame independently)
-    video_reshaped = video.reshape(C * T, 1, H, W)
+    # Reshape to (T*C, 1, H, W) for interpolate (treats each frame-channel independently)
+    video_reshaped = video.reshape(T * C, 1, H, W)
 
     # Resize using bilinear interpolation
     video_resized = torch.nn.functional.interpolate(
         video_reshaped, size=(new_h, new_w), mode="bilinear", align_corners=False
     )
 
-    # Reshape back to (C, T, new_H, new_W)
-    return video_resized.reshape(C, T, new_h, new_w)
+    # Reshape back to (T, C, new_H, new_W)
+    return video_resized.reshape(T, C, new_h, new_w)
 
 
 class NormalizeVideo(nn.Module):
     """Normalize video tensors with mean and standard deviation.
 
     This is a wrapper around tensor normalization that's compatible
-    with video data format (C, T, H, W).
+    with video data format (T, C, H, W).
     """
 
     def __init__(
@@ -693,14 +690,14 @@ class NormalizeVideo(nn.Module):
             std: Standard deviation values for (R, G, B) channels.
         """
         super().__init__()
-        self.mean = torch.tensor(mean).view(3, 1, 1, 1)
-        self.std = torch.tensor(std).view(3, 1, 1, 1)
+        self.mean = torch.tensor(mean).view(1, 3, 1, 1)
+        self.std = torch.tensor(std).view(1, 3, 1, 1)
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         """Normalize a video tensor.
 
         Args:
-            video: Video tensor of shape (C, T, H, W).
+            video: Video tensor of shape (T, C, H, W).
 
         Returns:
             Normalized video tensor.
@@ -778,6 +775,8 @@ def load_and_transform_video_data(
     device: torch.device | str,
     clip_duration: int = 2,
     clips_per_video: int = 5,
+    image_size: int = 224,
+    num_crops: int = 1,
     _sample_rate: int = 16000,
 ) -> Optional[torch.Tensor]:
     """Load and preprocess video files.
@@ -786,19 +785,21 @@ def load_and_transform_video_data(
     1. Loads video using OpenCV (cv2)
     2. Samples multiple clips uniformly across video duration
     3. Uniformly subsamples frames from each clip
-    4. Resizes shortest side to 224 while maintaining aspect ratio
+    4. Resizes shortest side to image_size while maintaining aspect ratio
     5. Normalizes with ImageNet statistics
-    6. Applies 3 spatial crops (left/center/right or top/center/bottom)
+    6. Applies spatial crops (left/center/right or top/center/bottom)
 
     Args:
         video_paths: List of file paths to video files, or None.
         device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
         clip_duration: Duration of each clip in seconds (also used as number of frames).
         clips_per_video: Number of clips to sample from each video.
+        image_size: Target size for image resize and spatial crop.
+        num_crops: Number of spatial crops to extract (1 for center only, 3 for left/center/right).
         _sample_rate: Unused parameter (kept for API compatibility).
 
     Returns:
-        Tensor of shape (batch_size, clips_per_video * 3, 3, clip_duration, 224, 224)
+        Tensor of shape (batch_size, clips_per_video * num_crops, 3, clip_duration, image_size, image_size)
         containing preprocessed video clips with spatial crops, or None if
         video_paths is None.
 
@@ -838,23 +839,23 @@ def load_and_transform_video_data(
             video_clip, _ = load_video_clip(video_path, start_time, end_time)
 
             # video_clip shape: (T, H, W, C) with values in [0, 255]
-            # Convert to (C, T, H, W) and normalize to [0, 1]
-            video_clip = video_clip.permute(3, 0, 1, 2).contiguous()  # (C, T, H, W)
+            # Convert to (T, C, H, W) and normalize to [0, 1]
+            video_clip = video_clip.permute(0, 3, 1, 2).contiguous()  # (T, C, H, W)
             video_clip = video_clip / 255.0
 
             # Subsample frames uniformly
             video_clip = subsample_frames_uniformly(video_clip, clip_duration)
 
-            # Resize short side to 224
-            video_clip = resize_short_side_video(video_clip, 224)
+            # Resize short side to target size
+            video_clip = resize_short_side_video(video_clip, image_size)
 
             # Normalize
             video_clip = normalizer(video_clip)
 
             all_video.append(video_clip)
 
-        # Apply spatial crops (creates 3x the number of clips)
-        all_video = SpatialCrop(224, num_crops=3)(all_video)
+        # Apply spatial crops
+        all_video = SpatialCrop(image_size, num_crops=num_crops)(all_video)
 
         all_video = torch.stack(all_video, dim=0)
         video_outputs.append(all_video)
