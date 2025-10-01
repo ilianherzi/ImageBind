@@ -15,9 +15,10 @@ Key pytorchvideo dependencies that need refactoring:
 
 from __future__ import annotations
 
+import io
 import logging
 import math
-from typing import Optional
+from typing import Optional, BinaryIO
 
 import pkg_resources
 import torch
@@ -127,6 +128,8 @@ def get_clip_timepoints(
 
     Iteratively samples clips from a video until the entire duration is covered.
 
+    DEPRECATED: Use sample_clip_timepoints() instead for pytorchvideo-free implementation.
+
     Args:
         clip_sampler: Sampler that determines clip duration and number of clips.
         duration: Total duration of the video in seconds.
@@ -143,6 +146,55 @@ def get_clip_timepoints(
         all_clips_timepoints.append((start, end))
 
     return all_clips_timepoints
+
+
+def sample_clip_timepoints(
+    duration: float,
+    clip_duration: float,
+    clips_per_video: int,
+) -> list[tuple[float, float]]:
+    """Sample clip timepoints uniformly from audio/video duration.
+
+    This is a replacement for pytorchvideo's ConstantClipsPerVideoSampler.
+    It divides the duration into evenly-spaced clips.
+
+    Strategy:
+    - If clips_per_video == 1: Takes center clip
+    - If clips_per_video > 1: Evenly spaces clips across duration
+    - Clips may overlap if clips_per_video * clip_duration > duration
+
+    Args:
+        duration: Total duration in seconds.
+        clip_duration: Duration of each clip in seconds.
+        clips_per_video: Number of clips to extract.
+
+    Returns:
+        List of (start_time, end_time) tuples in seconds for each clip.
+
+    Examples:
+        >>> sample_clip_timepoints(10.0, 2.0, 3)
+        [(0.0, 2.0), (4.0, 6.0), (8.0, 10.0)]
+
+        >>> sample_clip_timepoints(10.0, 2.0, 1)
+        [(4.0, 6.0)]  # Center clip
+    """
+    if clips_per_video == 1:
+        # Single clip: take from center
+        start_time = max(0, (duration - clip_duration) / 2)
+        return [(start_time, min(start_time + clip_duration, duration))]
+
+    # Multiple clips: evenly space them
+    # Calculate spacing between clip start times
+    max_start = max(0, duration - clip_duration)
+    interval = max_start / max(1, clips_per_video - 1)
+
+    clips = []
+    for i in range(clips_per_video):
+        start_time = min(i * interval, max_start)
+        end_time = min(start_time + clip_duration, duration)
+        clips.append((start_time, end_time))
+
+    return clips
 
 
 def load_and_transform_vision_data(
@@ -228,7 +280,7 @@ def load_and_transform_audio_data(
 
     This function:
     1. Loads audio waveforms and resamples to target sample rate
-    2. Splits audio into multiple clips using ConstantClipsPerVideoSampler
+    2. Splits audio into multiple clips uniformly across duration
     3. Converts each clip to mel spectrogram
     4. Normalizes spectrograms using provided mean and std
 
@@ -251,9 +303,6 @@ def load_and_transform_audio_data(
         return None
 
     audio_outputs = []
-    clip_sampler = ConstantClipsPerVideoSampler(
-        clip_duration=clip_duration, clips_per_video=clips_per_video
-    )
 
     for audio_path in audio_paths:
         # Load audio waveform
@@ -266,8 +315,10 @@ def load_and_transform_audio_data(
             )
 
         # Get clip timepoints
-        all_clips_timepoints = get_clip_timepoints(
-            clip_sampler, waveform.size(1) / sample_rate
+        duration = waveform.size(1) / sample_rate
+
+        all_clips_timepoints = sample_clip_timepoints(
+            duration, clip_duration, clips_per_video
         )
 
         # Extract and process each clip
@@ -292,6 +343,124 @@ def load_and_transform_audio_data(
         audio_outputs.append(all_clips)
 
     return torch.stack(audio_outputs, dim=0)
+
+
+def load_and_transform_audio_from_waveform(
+    waveform: torch.Tensor,
+    original_sr: int,
+    device: torch.device | str,
+    num_mel_bins: int = 128,
+    target_length: int = 204,
+    sample_rate: int = 16000,
+    clip_duration: float = 2.0,
+    clips_per_video: int = 3,
+    mean: float = -4.268,
+    std: float = 9.138,
+) -> torch.Tensor:
+    """Process audio waveform tensor to mel spectrograms.
+
+    This is useful when you've already loaded audio into memory (e.g., from video
+    container or streaming source) and don't want to save to disk first.
+
+    Args:
+        waveform: Audio waveform tensor of shape (channels, samples).
+        original_sr: Original sampling rate of the waveform.
+        device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
+        num_mel_bins: Number of mel-frequency bins for spectrogram.
+        target_length: Target number of frames for each spectrogram.
+        sample_rate: Target sampling rate in Hz for resampling.
+        clip_duration: Duration of each clip in seconds.
+        clips_per_video: Number of clips to sample from the audio.
+        mean: Mean for normalization of mel spectrograms.
+        std: Standard deviation for normalization of mel spectrograms.
+
+    Returns:
+        Tensor of shape (clips_per_video, 1, num_mel_bins, target_length)
+        containing preprocessed audio spectrograms.
+
+    Example:
+        >>> # Extract audio from video with ffmpeg or similar
+        >>> import torchaudio
+        >>> waveform, sr = torchaudio.load("audio.wav")
+        >>> spectrograms = load_and_transform_audio_from_waveform(
+        ...     waveform, sr, device="cuda"
+        ... )
+    """
+    # Resample if necessary
+    if sample_rate != original_sr:
+        waveform = torchaudio.functional.resample(
+            waveform, orig_freq=original_sr, new_freq=sample_rate
+        )
+
+    # Get clip timepoints
+    duration = waveform.size(1) / sample_rate
+    all_clips_timepoints = sample_clip_timepoints(
+        duration, clip_duration, clips_per_video
+    )
+
+    # Extract and process each clip
+    all_clips = []
+    for clip_timepoints in all_clips_timepoints:
+        waveform_clip = waveform[
+            :,
+            int(clip_timepoints[0] * sample_rate) : int(
+                clip_timepoints[1] * sample_rate
+            ),
+        ]
+        waveform_melspec = waveform2melspec(
+            waveform_clip, sample_rate, num_mel_bins, target_length
+        )
+        all_clips.append(waveform_melspec)
+
+    # Normalize spectrograms
+    normalize = TorchNormalize(mean=mean, std=std)
+    all_clips = [normalize(ac).to(device) for ac in all_clips]
+
+    return torch.stack(all_clips, dim=0)
+
+
+def load_audio_from_bytes(
+    audio_bytes: bytes | BinaryIO,
+    audio_format: Optional[str] = None,
+) -> tuple[torch.Tensor, int]:
+    """Load audio from binary data or file-like object.
+
+    This is useful when you have audio data in memory (e.g., extracted from
+    an MP4 video container) and want to avoid writing to disk.
+
+    Args:
+        audio_bytes: Raw audio bytes or file-like object (e.g., io.BytesIO).
+        audio_format: Audio format hint (e.g., "mp3", "wav", "mp4"). If None,
+            torchaudio will try to infer it.
+
+    Returns:
+        Tuple of (waveform, sample_rate) where waveform has shape (channels, samples).
+
+    Example:
+        >>> # From bytes
+        >>> with open("audio.mp3", "rb") as f:
+        ...     audio_bytes = f.read()
+        >>> waveform, sr = load_audio_from_bytes(audio_bytes, audio_format="mp3")
+
+        >>> # From BytesIO (e.g., audio extracted from video)
+        >>> import io
+        >>> audio_stream = io.BytesIO(extracted_audio_bytes)
+        >>> waveform, sr = load_audio_from_bytes(audio_stream)
+
+        >>> # Then process with existing function
+        >>> spectrograms = load_and_transform_audio_from_waveform(
+        ...     waveform, sr, device="cuda"
+        ... )
+    """
+    # Convert bytes to BytesIO if needed
+    if isinstance(audio_bytes, bytes):
+        audio_bytes = io.BytesIO(audio_bytes)
+
+    # Load using torchaudio
+    # Note: torchaudio.load can accept file-like objects
+    waveform, sample_rate = torchaudio.load(audio_bytes, format=audio_format)
+
+    return waveform, sample_rate
 
 
 def crop_boxes(boxes: torch.Tensor, x_offset: int, y_offset: int) -> torch.Tensor:
