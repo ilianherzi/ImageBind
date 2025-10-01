@@ -1,16 +1,14 @@
 """Data loading and transformation utilities for ImageBind multimodal inputs.
 
 This module provides functions to load and preprocess data from different modalities:
-- Vision (images)
-- Text
-- Audio (waveforms to mel spectrograms)
-- Video (with spatial and temporal sampling)
+- Vision (images) - using torchvision and PIL
+- Text - using BPE tokenization
+- Audio (waveforms to mel spectrograms) - using torchaudio
+- Video (with spatial and temporal sampling) - using OpenCV (cv2)
 
-Key pytorchvideo dependencies that need refactoring:
-- pv_transforms.ShortSideScale: Resizes video to have shortest side = 224
-- pv_transforms.UniformTemporalSubsample: Samples frames uniformly from clips
-- ConstantClipsPerVideoSampler: Samples fixed number of clips from video
-- EncodedVideo: Video decoding using decord backend
+All pytorchvideo dependencies have been removed and replaced with:
+- OpenCV (cv2) for video loading
+- Custom implementations for clip sampling, frame subsampling, and resizing
 """
 
 from __future__ import annotations
@@ -20,16 +18,14 @@ import logging
 import math
 from typing import Optional, BinaryIO
 
+import cv2
+import numpy as np
 import pkg_resources
 import torch
 import torch.nn as nn
 import torchaudio
 from PIL import Image
-from pytorchvideo import transforms as pv_transforms
-from pytorchvideo.data.clip_sampling import ConstantClipsPerVideoSampler
-from pytorchvideo.data.encoded_video import EncodedVideo
 from torchvision import transforms
-from torchvision.transforms import Normalize as TorchNormalize
 
 from imagebind.models.multimodal_preprocessors import SimpleTokenizer
 
@@ -118,34 +114,6 @@ def waveform2melspec(
     # Add channel dimension: (mel_bins, num_frames) -> (1, mel_bins, num_frames)
     fbank = fbank.unsqueeze(0)
     return fbank
-
-
-def get_clip_timepoints(
-    clip_sampler: ConstantClipsPerVideoSampler,
-    duration: float,
-) -> list[tuple[float, float]]:
-    """Extract all clip start and end timepoints from a video.
-
-    Iteratively samples clips from a video until the entire duration is covered.
-
-    DEPRECATED: Use sample_clip_timepoints() instead for pytorchvideo-free implementation.
-
-    Args:
-        clip_sampler: Sampler that determines clip duration and number of clips.
-        duration: Total duration of the video in seconds.
-
-    Returns:
-        List of (start_time, end_time) tuples in seconds for each clip.
-    """
-    all_clips_timepoints = []
-    is_last_clip = False
-    end = 0.0
-
-    while not is_last_clip:
-        start, end, _, _, is_last_clip = clip_sampler(end, duration, annotation=None)
-        all_clips_timepoints.append((start, end))
-
-    return all_clips_timepoints
 
 
 def sample_clip_timepoints(
@@ -336,7 +304,7 @@ def load_and_transform_audio_data(
             all_clips.append(waveform_melspec)
 
         # Normalize spectrograms
-        normalize = TorchNormalize(mean=mean, std=std)
+        normalize = transforms.Normalize(mean=mean, std=std)
         all_clips = [normalize(ac).to(device) for ac in all_clips]
 
         all_clips = torch.stack(all_clips, dim=0)
@@ -413,7 +381,7 @@ def load_and_transform_audio_from_waveform(
         all_clips.append(waveform_melspec)
 
     # Normalize spectrograms
-    normalize = TorchNormalize(mean=mean, std=std)
+    normalize = transforms.Normalize(mean=mean, std=std)
     all_clips = [normalize(ac).to(device) for ac in all_clips]
 
     return torch.stack(all_clips, dim=0)
@@ -564,42 +532,6 @@ def uniform_crop(
     return cropped, cropped_boxes
 
 
-class NormalizeVideo(nn.Module):
-    """Normalize video tensors with mean and standard deviation.
-
-    This is a wrapper around torchvision.transforms.Normalize that's compatible
-    with video data format.
-
-    Attributes:
-        mean: Mean values for each channel.
-        std: Standard deviation values for each channel.
-    """
-
-    def __init__(
-        self, mean: tuple[float, float, float], std: tuple[float, float, float]
-    ) -> None:
-        """Initialize the NormalizeVideo module.
-
-        Args:
-            mean: Mean values for (R, G, B) channels.
-            std: Standard deviation values for (R, G, B) channels.
-        """
-        super().__init__()
-        self.mean = mean
-        self.std = std
-
-    def forward(self, video: torch.Tensor) -> torch.Tensor:
-        """Normalize a video tensor.
-
-        Args:
-            video: Video tensor to normalize.
-
-        Returns:
-            Normalized video tensor.
-        """
-        return TorchNormalize(mean=self.mean, std=self.std)(video)
-
-
 class SpatialCrop(nn.Module):
     """Apply multiple spatial crops to video frames.
 
@@ -667,6 +599,180 @@ class SpatialCrop(nn.Module):
         return res
 
 
+def subsample_frames_uniformly(video: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """Uniformly subsample frames from a video tensor.
+
+    Replacement for pytorchvideo's UniformTemporalSubsample.
+
+    Args:
+        video: Video tensor of shape (C, T, H, W) or (T, H, W, C).
+        num_samples: Number of frames to sample.
+
+    Returns:
+        Subsampled video tensor with num_samples frames.
+
+    Example:
+        >>> video = torch.randn(3, 100, 224, 224)  # 100 frames
+        >>> sampled = subsample_frames_uniformly(video, 10)  # 10 frames
+        >>> sampled.shape
+        torch.Size([3, 10, 224, 224])
+    """
+    # Determine format: (C, T, H, W) or (T, H, W, C)
+    if video.ndim == 4:
+        if video.shape[0] == 3 or video.shape[0] == 1:
+            # Likely (C, T, H, W)
+            num_frames = video.shape[1]
+            indices = torch.linspace(0, num_frames - 1, num_samples).long()
+            return video[:, indices, :, :]
+        else:
+            # Likely (T, H, W, C)
+            num_frames = video.shape[0]
+            indices = torch.linspace(0, num_frames - 1, num_samples).long()
+            return video[indices, :, :, :]
+    else:
+        raise ValueError(f"Expected 4D tensor, got shape {video.shape}")
+
+
+def resize_short_side_video(
+    video: torch.Tensor,
+    target_size: int = 224,
+) -> torch.Tensor:
+    """Resize video so the shorter spatial dimension equals target size.
+
+    Replacement for pytorchvideo's ShortSideScale. Maintains aspect ratio.
+
+    Args:
+        video: Video tensor of shape (C, T, H, W).
+        target_size: Target size for the shorter spatial dimension.
+
+    Returns:
+        Resized video tensor of shape (C, T, new_H, new_W).
+
+    Example:
+        >>> video = torch.randn(3, 10, 480, 640)  # 480x640 video
+        >>> resized = resize_short_side_video(video, 224)
+        >>> resized.shape  # Shorter side (480) becomes 224
+        torch.Size([3, 10, 224, 298])
+    """
+    C, T, H, W = video.shape
+
+    # Calculate new dimensions maintaining aspect ratio
+    if H < W:
+        new_h = target_size
+        new_w = int(W * target_size / H)
+    else:
+        new_h = int(H * target_size / W)
+        new_w = target_size
+
+    # Reshape to (C*T, 1, H, W) for interpolate (treats each frame independently)
+    video_reshaped = video.reshape(C * T, 1, H, W)
+
+    # Resize using bilinear interpolation
+    video_resized = torch.nn.functional.interpolate(
+        video_reshaped, size=(new_h, new_w), mode="bilinear", align_corners=False
+    )
+
+    # Reshape back to (C, T, new_H, new_W)
+    return video_resized.reshape(C, T, new_h, new_w)
+
+
+class NormalizeVideo(nn.Module):
+    """Normalize video tensors with mean and standard deviation.
+
+    This is a wrapper around tensor normalization that's compatible
+    with video data format (C, T, H, W).
+    """
+
+    def __init__(
+        self, mean: tuple[float, float, float], std: tuple[float, float, float]
+    ) -> None:
+        """Initialize the NormalizeVideo module.
+
+        Args:
+            mean: Mean values for (R, G, B) channels.
+            std: Standard deviation values for (R, G, B) channels.
+        """
+        super().__init__()
+        self.mean = torch.tensor(mean).view(3, 1, 1, 1)
+        self.std = torch.tensor(std).view(3, 1, 1, 1)
+
+    def forward(self, video: torch.Tensor) -> torch.Tensor:
+        """Normalize a video tensor.
+
+        Args:
+            video: Video tensor of shape (C, T, H, W).
+
+        Returns:
+            Normalized video tensor.
+        """
+        # Move mean/std to same device as video
+        if self.mean.device != video.device:
+            self.mean = self.mean.to(video.device)
+            self.std = self.std.to(video.device)
+
+        return (video - self.mean) / self.std
+
+
+def load_video_clip(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+) -> tuple[torch.Tensor, float]:
+    """Load video clip using OpenCV.
+
+    Args:
+        video_path: Path to video file.
+        start_time: Start time in seconds.
+        end_time: End time in seconds.
+
+    Returns:
+        Tuple of (video_tensor, fps) where video_tensor has shape (T, H, W, C)
+        and values in [0, 255].
+
+    Raises:
+        ValueError: If video cannot be opened.
+    """
+    # Open video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Convert time to frame indices
+    start_frame = int(start_time * fps)
+    end_frame = int(end_time * fps)
+
+    # Ensure valid range
+    start_frame = max(0, start_frame)
+    end_frame = min(total_frames, end_frame)
+
+    # Set position to start frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    # Read frames
+    frames = []
+    for _ in range(end_frame - start_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Convert BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+
+    cap.release()
+
+    if not frames:
+        # If no frames were read, return a single black frame
+        raise ValueError("No frames returned")
+    # Convert to tensor (T, H, W, C)
+    video_tensor = torch.from_numpy(np.stack(frames)).float()
+
+    return video_tensor, fps
+
+
 def load_and_transform_video_data(
     video_paths: Optional[list[str]],
     device: torch.device | str,
@@ -677,23 +783,17 @@ def load_and_transform_video_data(
     """Load and preprocess video files.
 
     This function performs the following steps:
-    1. Loads video using EncodedVideo (decord backend) - PYTORCHVIDEO DEPENDENCY
-    2. Samples multiple clips from each video using ConstantClipsPerVideoSampler - PYTORCHVIDEO DEPENDENCY
-    3. Uniformly subsamples frames from each clip using UniformTemporalSubsample - PYTORCHVIDEO DEPENDENCY
-    4. Resizes shortest side to 224 using ShortSideScale - PYTORCHVIDEO DEPENDENCY
+    1. Loads video using OpenCV (cv2)
+    2. Samples multiple clips uniformly across video duration
+    3. Uniformly subsamples frames from each clip
+    4. Resizes shortest side to 224 while maintaining aspect ratio
     5. Normalizes with ImageNet statistics
     6. Applies 3 spatial crops (left/center/right or top/center/bottom)
-
-    REFACTORING NOTES:
-    - Replace EncodedVideo with torchvision.io.read_video or decord directly
-    - Replace ConstantClipsPerVideoSampler with manual clip sampling logic
-    - Replace UniformTemporalSubsample with torch indexing (e.g., frames[::stride])
-    - Replace ShortSideScale with torchvision.transforms.Resize
 
     Args:
         video_paths: List of file paths to video files, or None.
         device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
-        clip_duration: Duration of each clip in seconds.
+        clip_duration: Duration of each clip in seconds (also used as number of frames).
         clips_per_video: Number of clips to sample from each video.
         _sample_rate: Unused parameter (kept for API compatibility).
 
@@ -703,57 +803,55 @@ def load_and_transform_video_data(
         video_paths is None.
 
     Raises:
-        ValueError: If no clip data is found in the video.
+        ValueError: If video cannot be loaded.
     """
     if video_paths is None:
         return None
 
     video_outputs = []
-    video_transform = transforms.Compose(
-        [
-            pv_transforms.ShortSideScale(
-                224
-            ),  # PYTORCHVIDEO - resize shortest side to 224
-            NormalizeVideo(
-                mean=(0.48145466, 0.4578275, 0.40821073),
-                std=(0.26862954, 0.26130258, 0.27577711),
-            ),
-        ]
-    )
 
-    clip_sampler = ConstantClipsPerVideoSampler(  # PYTORCHVIDEO - samples fixed clips
-        clip_duration=clip_duration, clips_per_video=clips_per_video
-    )
-    frame_sampler = (
-        pv_transforms.UniformTemporalSubsample(  # PYTORCHVIDEO - uniform frame sampling
-            num_samples=clip_duration
-        )
+    # Create normalization transform
+    normalizer = NormalizeVideo(
+        mean=(0.48145466, 0.4578275, 0.40821073),
+        std=(0.26862954, 0.26130258, 0.27577711),
     )
 
     for video_path in video_paths:
-        # PYTORCHVIDEO - Load video with decord backend
-        video = EncodedVideo.from_path(
-            video_path,
-            decoder="decord",
-            decode_audio=False,
+        # Load video to get duration
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps
+        cap.release()
+
+        # Sample clip timepoints uniformly
+        all_clips_timepoints = sample_clip_timepoints(
+            duration, clip_duration, clips_per_video
         )
 
-        # Get all clip timepoints
-        all_clips_timepoints = get_clip_timepoints(clip_sampler, video.duration)
-
         all_video = []
-        for clip_timepoints in all_clips_timepoints:
-            # Read the clip and extract frames
-            clip = video.get_clip(clip_timepoints[0], clip_timepoints[1])
-            if clip is None:
-                raise ValueError("No clip found")
-            video_clip = frame_sampler(clip["video"])
-            video_clip = video_clip / 255.0  # Normalize to [0, 1] range
+        for start_time, end_time in all_clips_timepoints:
+            # Load video clip
+            video_clip, _ = load_video_clip(video_path, start_time, end_time)
+
+            # video_clip shape: (T, H, W, C) with values in [0, 255]
+            # Convert to (C, T, H, W) and normalize to [0, 1]
+            video_clip = video_clip.permute(3, 0, 1, 2).contiguous()  # (C, T, H, W)
+            video_clip = video_clip / 255.0
+
+            # Subsample frames uniformly
+            video_clip = subsample_frames_uniformly(video_clip, clip_duration)
+
+            # Resize short side to 224
+            video_clip = resize_short_side_video(video_clip, 224)
+
+            # Normalize
+            video_clip = normalizer(video_clip)
 
             all_video.append(video_clip)
-
-        # Apply video transform (resize + normalize)
-        all_video = [video_transform(clip) for clip in all_video]
 
         # Apply spatial crops (creates 3x the number of clips)
         all_video = SpatialCrop(224, num_crops=3)(all_video)
