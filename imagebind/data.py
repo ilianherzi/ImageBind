@@ -1,14 +1,25 @@
-#!/usr/bin/env python3
-# Portions Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+"""Data loading and transformation utilities for ImageBind multimodal inputs.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+This module provides functions to load and preprocess data from different modalities:
+- Vision (images)
+- Text
+- Audio (waveforms to mel spectrograms)
+- Video (with spatial and temporal sampling)
+
+Key pytorchvideo dependencies that need refactoring:
+- pv_transforms.ShortSideScale: Resizes video to have shortest side = 224
+- pv_transforms.UniformTemporalSubsample: Samples frames uniformly from clips
+- ConstantClipsPerVideoSampler: Samples fixed number of clips from video
+- EncodedVideo: Video decoding using decord backend
+"""
+
+from __future__ import annotations
 
 import logging
 import math
-import pkg_resources
+from typing import Optional
 
+import pkg_resources
 import torch
 import torch.nn as nn
 import torchaudio
@@ -17,22 +28,57 @@ from pytorchvideo import transforms as pv_transforms
 from pytorchvideo.data.clip_sampling import ConstantClipsPerVideoSampler
 from pytorchvideo.data.encoded_video import EncodedVideo
 from torchvision import transforms
-from torchvision.transforms import Normalize
+from torchvision.transforms import Normalize as TorchNormalize
 
 from imagebind.models.multimodal_preprocessors import SimpleTokenizer
 
 DEFAULT_AUDIO_FRAME_SHIFT_MS = 10  # in milliseconds
 
 
-def return_bpe_path():
+def return_bpe_path() -> str:
+    """Return the path to the BPE (Byte Pair Encoding) vocabulary file.
+
+    Returns:
+        Path to the BPE vocabulary file for text tokenization.
+    """
     return pkg_resources.resource_filename(
         "imagebind", "bpe/bpe_simple_vocab_16e6.txt.gz"
     )
 
 
-def waveform2melspec(waveform, sample_rate, num_mel_bins, target_length):
-    # Based on https://github.com/YuanGongND/ast/blob/d7d8b4b8e06cdaeb6c843cdb38794c1c7692234c/src/dataloader.py#L102
+def waveform2melspec(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    num_mel_bins: int,
+    target_length: int,
+) -> torch.Tensor:
+    """Convert audio waveform to mel-frequency spectrogram.
+
+    This function:
+    1. Mean-centers the waveform
+    2. Computes mel-frequency filter bank features using Kaldi-compatible settings
+    3. Pads or crops to target length
+    4. Returns as a single-channel image-like tensor
+
+    Based on: https://github.com/YuanGongND/ast/blob/d7d8b4b8e06cdaeb6c843cdb38794c1c7692234c/src/dataloader.py#L102
+
+    Args:
+        waveform: Audio waveform tensor of shape (channels, samples).
+        sample_rate: Audio sampling rate in Hz.
+        num_mel_bins: Number of mel-frequency bins.
+        target_length: Target number of frames for the output spectrogram.
+
+    Returns:
+        Mel spectrogram tensor of shape (1, num_mel_bins, target_length),
+        formatted as a single-channel image.
+
+    Warnings:
+        Logs a warning if padding/cropping exceeds 20% of the original length.
+    """
+    # Mean-center the waveform
     waveform -= waveform.mean()
+
+    # Compute mel-frequency filter bank features
     fbank = torchaudio.compliance.kaldi.fbank(
         waveform,
         htk_compat=True,
@@ -44,12 +90,15 @@ def waveform2melspec(waveform, sample_rate, num_mel_bins, target_length):
         frame_length=25,
         frame_shift=DEFAULT_AUDIO_FRAME_SHIFT_MS,
     )
-    # Convert to [mel_bins, num_frames] shape
+
+    # Convert from (num_frames, mel_bins) to (mel_bins, num_frames)
     fbank = fbank.transpose(0, 1)
-    # Pad to target_length
+
+    # Pad or crop to target_length
     n_frames = fbank.size(1)
     p = target_length - n_frames
-    # if p is too large (say >20%), flash a warning
+
+    # Warn if padding/cropping is more than 20% of original length
     if abs(p) / n_frames > 0.2:
         logging.warning(
             "Large gap between audio n_frames(%d) and "
@@ -58,29 +107,60 @@ def waveform2melspec(waveform, sample_rate, num_mel_bins, target_length):
             n_frames,
             target_length,
         )
-    # cut and pad
+
+    # Apply padding or cropping
     if p > 0:
         fbank = torch.nn.functional.pad(fbank, (0, p), mode="constant", value=0)
     elif p < 0:
         fbank = fbank[:, 0:target_length]
-    # Convert to [1, mel_bins, num_frames] shape, essentially like a 1
-    # channel image
+
+    # Add channel dimension: (mel_bins, num_frames) -> (1, mel_bins, num_frames)
     fbank = fbank.unsqueeze(0)
     return fbank
 
 
-def get_clip_timepoints(clip_sampler, duration):
-    # Read out all clips in this video
+def get_clip_timepoints(
+    clip_sampler: ConstantClipsPerVideoSampler,
+    duration: float,
+) -> list[tuple[float, float]]:
+    """Extract all clip start and end timepoints from a video.
+
+    Iteratively samples clips from a video until the entire duration is covered.
+
+    Args:
+        clip_sampler: Sampler that determines clip duration and number of clips.
+        duration: Total duration of the video in seconds.
+
+    Returns:
+        List of (start_time, end_time) tuples in seconds for each clip.
+    """
     all_clips_timepoints = []
     is_last_clip = False
     end = 0.0
+
     while not is_last_clip:
         start, end, _, _, is_last_clip = clip_sampler(end, duration, annotation=None)
         all_clips_timepoints.append((start, end))
+
     return all_clips_timepoints
 
 
-def load_and_transform_vision_data(image_paths, device):
+def load_and_transform_vision_data(
+    image_paths: Optional[list[str]],
+    device: torch.device | str,
+) -> Optional[torch.Tensor]:
+    """Load and preprocess images for vision encoder.
+
+    Applies standard ImageNet normalization and resizing to 224x224.
+
+    Args:
+        image_paths: List of file paths to images, or None.
+        device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
+
+    Returns:
+        Tensor of shape (batch_size, 3, 224, 224) containing preprocessed images,
+        or None if image_paths is None.
+    """
     if image_paths is None:
         return None
 
@@ -104,12 +184,29 @@ def load_and_transform_vision_data(image_paths, device):
 
         image = data_transform(image).to(device)
         image_outputs.append(image)
+
     return torch.stack(image_outputs, dim=0)
 
 
-def load_and_transform_text(text, device):
+def load_and_transform_text(
+    text: Optional[list[str]],
+    device: torch.device | str,
+) -> Optional[torch.Tensor]:
+    """Tokenize and encode text for text encoder.
+
+    Uses BPE (Byte Pair Encoding) tokenization.
+
+    Args:
+        text: List of text strings to tokenize, or None.
+        device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
+
+    Returns:
+        Tensor of shape (batch_size, context_length) containing token indices,
+        or None if text is None.
+    """
     if text is None:
         return None
+
     tokenizer = SimpleTokenizer(bpe_path=return_bpe_path())
     tokens = [tokenizer(t).unsqueeze(0).to(device) for t in text]
     tokens = torch.cat(tokens, dim=0)
@@ -117,16 +214,39 @@ def load_and_transform_text(text, device):
 
 
 def load_and_transform_audio_data(
-    audio_paths,
-    device,
-    num_mel_bins=128,
-    target_length=204,
-    sample_rate=16000,
-    clip_duration=2,
-    clips_per_video=3,
-    mean=-4.268,
-    std=9.138,
-):
+    audio_paths: Optional[list[str]],
+    device: torch.device | str,
+    num_mel_bins: int = 128,
+    target_length: int = 204,
+    sample_rate: int = 16000,
+    clip_duration: float = 2.0,
+    clips_per_video: int = 3,
+    mean: float = -4.268,
+    std: float = 9.138,
+) -> Optional[torch.Tensor]:
+    """Load and preprocess audio files to mel spectrograms.
+
+    This function:
+    1. Loads audio waveforms and resamples to target sample rate
+    2. Splits audio into multiple clips using ConstantClipsPerVideoSampler
+    3. Converts each clip to mel spectrogram
+    4. Normalizes spectrograms using provided mean and std
+
+    Args:
+        audio_paths: List of file paths to audio files, or None.
+        device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
+        num_mel_bins: Number of mel-frequency bins for spectrogram.
+        target_length: Target number of frames for each spectrogram.
+        sample_rate: Target sampling rate in Hz for resampling.
+        clip_duration: Duration of each clip in seconds.
+        clips_per_video: Number of clips to sample from each audio file.
+        mean: Mean for normalization of mel spectrograms.
+        std: Standard deviation for normalization of mel spectrograms.
+
+    Returns:
+        Tensor of shape (batch_size, clips_per_video, 1, num_mel_bins, target_length)
+        containing preprocessed audio spectrograms, or None if audio_paths is None.
+    """
     if audio_paths is None:
         return None
 
@@ -136,14 +256,21 @@ def load_and_transform_audio_data(
     )
 
     for audio_path in audio_paths:
+        # Load audio waveform
         waveform, sr = torchaudio.load(audio_path)
+
+        # Resample if necessary
         if sample_rate != sr:
             waveform = torchaudio.functional.resample(
                 waveform, orig_freq=sr, new_freq=sample_rate
             )
+
+        # Get clip timepoints
         all_clips_timepoints = get_clip_timepoints(
             clip_sampler, waveform.size(1) / sample_rate
         )
+
+        # Extract and process each clip
         all_clips = []
         for clip_timepoints in all_clips_timepoints:
             waveform_clip = waveform[
@@ -157,7 +284,8 @@ def load_and_transform_audio_data(
             )
             all_clips.append(waveform_melspec)
 
-        normalize = transforms.Normalize(mean=mean, std=std)
+        # Normalize spectrograms
+        normalize = TorchNormalize(mean=mean, std=std)
         all_clips = [normalize(ac).to(device) for ac in all_clips]
 
         all_clips = torch.stack(all_clips, dim=0)
@@ -166,17 +294,17 @@ def load_and_transform_audio_data(
     return torch.stack(audio_outputs, dim=0)
 
 
-def crop_boxes(boxes, x_offset, y_offset):
-    """
-    Perform crop on the bounding boxes given the offsets.
+def crop_boxes(boxes: torch.Tensor, x_offset: int, y_offset: int) -> torch.Tensor:
+    """Adjust bounding box coordinates after spatial cropping.
+
     Args:
-        boxes (ndarray or None): bounding boxes to perform crop. The dimension
-            is `num boxes` x 4.
-        x_offset (int): cropping offset in the x axis.
-        y_offset (int): cropping offset in the y axis.
+        boxes: Bounding boxes of shape (num_boxes, 4) in format [x1, y1, x2, y2].
+        x_offset: Horizontal offset of the crop in pixels.
+        y_offset: Vertical offset of the crop in pixels.
+
     Returns:
-        cropped_boxes (ndarray or None): the cropped boxes with dimension of
-            `num boxes` x 4.
+        Adjusted bounding boxes of shape (num_boxes, 4) with coordinates
+        relative to the cropped region.
     """
     cropped_boxes = boxes.copy()
     cropped_boxes[:, [0, 2]] = boxes[:, [0, 2]] - x_offset
@@ -185,33 +313,47 @@ def crop_boxes(boxes, x_offset, y_offset):
     return cropped_boxes
 
 
-def uniform_crop(images, size, spatial_idx, boxes=None, scale_size=None):
-    """
-    Perform uniform spatial sampling on the images and corresponding boxes.
+def uniform_crop(
+    images: torch.Tensor,
+    size: int,
+    spatial_idx: int,
+    boxes: Optional[torch.Tensor] = None,
+    scale_size: Optional[int] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Perform uniform spatial cropping on images.
+
+    This function supports three crop positions:
+    - If width > height: left (0), center (1), or right (2)
+    - If height > width: top (0), center (1), or bottom (2)
+
     Args:
-        images (tensor): images to perform uniform crop. The dimension is
-            `num frames` x `channel` x `height` x `width`.
-        size (int): size of height and weight to crop the images.
-        spatial_idx (int): 0, 1, or 2 for left, center, and right crop if width
-            is larger than height. Or 0, 1, or 2 for top, center, and bottom
-            crop if height is larger than width.
-        boxes (ndarray or None): optional. Corresponding boxes to images.
-            Dimension is `num boxes` x 4.
-        scale_size (int): optinal. If not None, resize the images to scale_size before
-            performing any crop.
+        images: Images tensor of shape (num_frames, channels, height, width)
+            or (channels, height, width).
+        size: Target size for both height and width of the crop.
+        spatial_idx: Crop position index (0=left/top, 1=center, 2=right/bottom).
+        boxes: Optional bounding boxes of shape (num_boxes, 4) to crop accordingly.
+        scale_size: Optional size to resize images to before cropping.
+
     Returns:
-        cropped (tensor): images with dimension of
-            `num frames` x `channel` x `size` x `size`.
-        cropped_boxes (ndarray or None): the cropped boxes with dimension of
-            `num boxes` x 4.
+        Tuple of:
+        - Cropped images of shape (num_frames, channels, size, size) or
+          (channels, size, size).
+        - Cropped bounding boxes of shape (num_boxes, 4) or None.
+
+    Raises:
+        AssertionError: If spatial_idx is not in [0, 1, 2].
     """
     assert spatial_idx in [0, 1, 2]
     ndim = len(images.shape)
+
+    # Add batch dimension if needed
     if ndim == 3:
         images = images.unsqueeze(0)
+
     height = images.shape[2]
     width = images.shape[3]
 
+    # Optional resize before cropping
     if scale_size is not None:
         if width <= height:
             width, height = scale_size, int(height / width * scale_size)
@@ -224,83 +366,185 @@ def uniform_crop(images, size, spatial_idx, boxes=None, scale_size=None):
             align_corners=False,
         )
 
+    # Calculate default center crop offsets
     y_offset = int(math.ceil((height - size) / 2))
     x_offset = int(math.ceil((width - size) / 2))
 
+    # Adjust offsets based on spatial_idx
     if height > width:
+        # Vertical crops (top, center, bottom)
         if spatial_idx == 0:
             y_offset = 0
         elif spatial_idx == 2:
             y_offset = height - size
     else:
+        # Horizontal crops (left, center, right)
         if spatial_idx == 0:
             x_offset = 0
         elif spatial_idx == 2:
             x_offset = width - size
+
+    # Perform the crop
     cropped = images[:, :, y_offset : y_offset + size, x_offset : x_offset + size]
     cropped_boxes = crop_boxes(boxes, x_offset, y_offset) if boxes is not None else None
+
+    # Remove batch dimension if it was added
     if ndim == 3:
         cropped = cropped.squeeze(0)
+
     return cropped, cropped_boxes
 
 
-class SpatialCrop(nn.Module):
-    """
-    Convert the video into 3 smaller clips spatially. Must be used after the
-        temporal crops to get spatial crops, and should be used with
-        -2 in the spatial crop at the slowfast augmentation stage (so full
-        frames are passed in here). Will return a larger list with the
-        3x spatial crops as well.
+class NormalizeVideo(nn.Module):
+    """Normalize video tensors with mean and standard deviation.
+
+    This is a wrapper around torchvision.transforms.Normalize that's compatible
+    with video data format.
+
+    Attributes:
+        mean: Mean values for each channel.
+        std: Standard deviation values for each channel.
     """
 
-    def __init__(self, crop_size: int = 224, num_crops: int = 3):
+    def __init__(
+        self, mean: tuple[float, float, float], std: tuple[float, float, float]
+    ) -> None:
+        """Initialize the NormalizeVideo module.
+
+        Args:
+            mean: Mean values for (R, G, B) channels.
+            std: Standard deviation values for (R, G, B) channels.
+        """
+        super().__init__()
+        self.mean = mean
+        self.std = std
+
+    def forward(self, video: torch.Tensor) -> torch.Tensor:
+        """Normalize a video tensor.
+
+        Args:
+            video: Video tensor to normalize.
+
+        Returns:
+            Normalized video tensor.
+        """
+        return TorchNormalize(mean=self.mean, std=self.std)(video)
+
+
+class SpatialCrop(nn.Module):
+    """Apply multiple spatial crops to video frames.
+
+    This module creates multiple views of each video by cropping at different
+    spatial positions (left/top, center, right/bottom). This is commonly used
+    for data augmentation and test-time augmentation.
+
+    Attributes:
+        crop_size: Size of the square crop.
+        crops_to_ext: List of spatial indices to extract.
+        flipped_crops_to_ext: List of spatial indices to extract from flipped video.
+    """
+
+    def __init__(self, crop_size: int = 224, num_crops: int = 3) -> None:
+        """Initialize the SpatialCrop module.
+
+        Args:
+            crop_size: Size of the square crop in pixels.
+            num_crops: Number of crops to extract (1 for center only, 3 for
+                left/center/right or top/center/bottom).
+
+        Raises:
+            NotImplementedError: If num_crops is not 1 or 3.
+        """
         super().__init__()
         self.crop_size = crop_size
         if num_crops == 3:
             self.crops_to_ext = [0, 1, 2]
             self.flipped_crops_to_ext = []
         elif num_crops == 1:
-            self.crops_to_ext = [1]
+            self.crops_to_ext = [1]  # Center crop only
             self.flipped_crops_to_ext = []
         else:
             raise NotImplementedError("Nothing else supported yet")
 
-    def forward(self, videos):
-        """
+    def forward(self, videos: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Apply spatial crops to a list of videos.
+
         Args:
-            videos: A list of C, T, H, W videos.
+            videos: List of video tensors, each of shape (C, T, H, W).
+
         Returns:
-            videos: A list with 3x the number of elements. Each video converted
-                to C, T, H', W' by spatial cropping.
+            List of cropped videos, each of shape (C, T, crop_size, crop_size).
+            Length is num_crops times the input length.
+
+        Raises:
+            AssertionError: If input is not a list or videos don't have 4 dimensions.
         """
         assert isinstance(videos, list), "Must be a list of videos after temporal crops"
         assert all([video.ndim == 4 for video in videos]), "Must be (C,T,H,W)"
+
         res = []
         for video in videos:
+            # Extract crops at specified positions
             for spatial_idx in self.crops_to_ext:
                 res.append(uniform_crop(video, self.crop_size, spatial_idx)[0])
+
+            # Extract crops from horizontally flipped video if specified
             if not self.flipped_crops_to_ext:
                 continue
             flipped_video = transforms.functional.hflip(video)
             for spatial_idx in self.flipped_crops_to_ext:
                 res.append(uniform_crop(flipped_video, self.crop_size, spatial_idx)[0])
+
         return res
 
 
 def load_and_transform_video_data(
-    video_paths,
-    device,
-    clip_duration=2,
-    clips_per_video=5,
-    sample_rate=16000,
-):
+    video_paths: Optional[list[str]],
+    device: torch.device | str,
+    clip_duration: int = 2,
+    clips_per_video: int = 5,
+    _sample_rate: int = 16000,
+) -> Optional[torch.Tensor]:
+    """Load and preprocess video files.
+
+    This function performs the following steps:
+    1. Loads video using EncodedVideo (decord backend) - PYTORCHVIDEO DEPENDENCY
+    2. Samples multiple clips from each video using ConstantClipsPerVideoSampler - PYTORCHVIDEO DEPENDENCY
+    3. Uniformly subsamples frames from each clip using UniformTemporalSubsample - PYTORCHVIDEO DEPENDENCY
+    4. Resizes shortest side to 224 using ShortSideScale - PYTORCHVIDEO DEPENDENCY
+    5. Normalizes with ImageNet statistics
+    6. Applies 3 spatial crops (left/center/right or top/center/bottom)
+
+    REFACTORING NOTES:
+    - Replace EncodedVideo with torchvision.io.read_video or decord directly
+    - Replace ConstantClipsPerVideoSampler with manual clip sampling logic
+    - Replace UniformTemporalSubsample with torch indexing (e.g., frames[::stride])
+    - Replace ShortSideScale with torchvision.transforms.Resize
+
+    Args:
+        video_paths: List of file paths to video files, or None.
+        device: Device to place the tensors on (e.g., 'cuda' or 'cpu').
+        clip_duration: Duration of each clip in seconds.
+        clips_per_video: Number of clips to sample from each video.
+        _sample_rate: Unused parameter (kept for API compatibility).
+
+    Returns:
+        Tensor of shape (batch_size, clips_per_video * 3, 3, clip_duration, 224, 224)
+        containing preprocessed video clips with spatial crops, or None if
+        video_paths is None.
+
+    Raises:
+        ValueError: If no clip data is found in the video.
+    """
     if video_paths is None:
         return None
 
     video_outputs = []
     video_transform = transforms.Compose(
         [
-            pv_transforms.ShortSideScale(224),
+            pv_transforms.ShortSideScale(
+                224
+            ),  # PYTORCHVIDEO - resize shortest side to 224
             NormalizeVideo(
                 mean=(0.48145466, 0.4578275, 0.40821073),
                 std=(0.26862954, 0.26130258, 0.27577711),
@@ -308,33 +552,41 @@ def load_and_transform_video_data(
         ]
     )
 
-    clip_sampler = ConstantClipsPerVideoSampler(
+    clip_sampler = ConstantClipsPerVideoSampler(  # PYTORCHVIDEO - samples fixed clips
         clip_duration=clip_duration, clips_per_video=clips_per_video
     )
-    frame_sampler = pv_transforms.UniformTemporalSubsample(num_samples=clip_duration)
+    frame_sampler = (
+        pv_transforms.UniformTemporalSubsample(  # PYTORCHVIDEO - uniform frame sampling
+            num_samples=clip_duration
+        )
+    )
 
     for video_path in video_paths:
+        # PYTORCHVIDEO - Load video with decord backend
         video = EncodedVideo.from_path(
             video_path,
             decoder="decord",
             decode_audio=False,
-            **{"sample_rate": sample_rate},
         )
 
+        # Get all clip timepoints
         all_clips_timepoints = get_clip_timepoints(clip_sampler, video.duration)
 
         all_video = []
         for clip_timepoints in all_clips_timepoints:
-            # Read the clip, get frames
+            # Read the clip and extract frames
             clip = video.get_clip(clip_timepoints[0], clip_timepoints[1])
             if clip is None:
                 raise ValueError("No clip found")
             video_clip = frame_sampler(clip["video"])
-            video_clip = video_clip / 255.0  # since this is float, need 0-1
+            video_clip = video_clip / 255.0  # Normalize to [0, 1] range
 
             all_video.append(video_clip)
 
+        # Apply video transform (resize + normalize)
         all_video = [video_transform(clip) for clip in all_video]
+
+        # Apply spatial crops (creates 3x the number of clips)
         all_video = SpatialCrop(224, num_crops=3)(all_video)
 
         all_video = torch.stack(all_video, dim=0)
